@@ -1,0 +1,7 @@
+episode,total_steps,episode_reward,episode_length,max_y_distance,termination_reason,collision_type,checkpoints_reached,override_count,min_clear_above,wall_time
+1,1,-86.471466,1,0.0,out_of_bounds,,,0,0.7758913040161133,1758264267.2219768
+2,2,-86.479813,1,0.0,out_of_bounds,,,0,0.7760984897613525,1758264286.4017763
+3,3,-86.474678,1,0.0,out_of_bounds,,,0,0.7764899730682373,1758264305.6893208
+4,4,-86.489372,1,0.0,out_of_bounds,,,0,0.7759237289428711,1758264324.0881438
+5,5,-86.479279,1,0.0,out_of_bounds,,,0,0.776052713394165,1758264343.818792
+6,6,-86.479507,1,0.0,out_of_bounds,,,0,0.7760953903198242,1758264362.978765

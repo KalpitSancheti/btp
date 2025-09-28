@@ -1,364 +1,570 @@
-# td3_per.py
+'''
+Author: Sunghoon Hong
+Title: td3_per.py
+Description:
+    Twin Delayed Deep Deterministic Policy Gradient Agent for Airsim
+Detail:
+    - not use join()
+    - reset for zero-image error
+    - tensorflow v1 + keras
+    - soft update for target model
+    - using PER
+'''
+
 
 import os
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, Conv2D, Flatten, Concatenate
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-import matplotlib.pyplot as plt
-import re
+import csv
+import time
+import random
+import argparse
+from copy import deepcopy
 from collections import deque
+from datetime import datetime as dt
+import numpy as np
+import tensorflow as tf
+import tensorflow.keras.backend as K
 
-# Import your custom modules
-from airsim_env2 import Env
-from PER import PrioritizedReplayBuffer
-import config
+# tf.compat.v1.disable_eager_execution()  # MUST remain eager in TF2+
+from keras.layers import TimeDistributed, BatchNormalization, Flatten, Add, Lambda, Concatenate
+from keras.layers import Conv2D, MaxPooling2D, Dense, GRU, Input, ELU, Activation
+from keras.optimizers import Adam
+from keras.models import Model
+from PIL import Image
+import cv2
+from airsim_env import Env
+from PER import Memory
 
-# --- Robust Image Processing ---
-def _process_image(response):
-    """
-    Robust image -> single-channel float32 array in shape config.STATE_IMAGE_SHAPE.
-    Handles both image_data_uint8 (RGB) and image_data_float (depth).
-    """
-    # safe empty/default
-    out_shape = tuple(config.STATE_IMAGE_SHAPE)
-    zeros = np.zeros(out_shape, dtype=np.float32)
-
-    if response is None:
-        return zeros
-
-    # 1) Prefer uint8 (RGB) if present
-    try:
-        if hasattr(response, "image_data_uint8") and response.image_data_uint8:
-            img = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
-            # some AirSim responses include padding; guard with expected size:
-            expected = int(response.height) * int(response.width) * 3
-            if img.size != expected:
-                return zeros
-            img = img.reshape(response.height, response.width, 3)
-            # convert to grayscale, resize, normalize
-            img_tf = tf.image.rgb_to_grayscale(img)
-            img_tf = tf.image.resize(img_tf, [out_shape[0], out_shape[1]])
-            img_np = img_tf.numpy().astype(np.float32) / 255.0
-            return img_np
-    except Exception:
-        # fall through to float processing or return zeros
-        pass
-
-    # 2) Fallback: float image (depth / depthVis) -> single channel
-    try:
-        if hasattr(response, "image_data_float") and response.image_data_float:
-            arr = np.array(response.image_data_float, dtype=np.float32)
-            expected = int(response.height) * int(response.width)
-            if arr.size != expected:
-                return zeros
-            arr = arr.reshape(response.height, response.width, 1)
-            # resize
-            img_tf = tf.image.resize(arr, [out_shape[0], out_shape[1]])
-            img_np = img_tf.numpy().astype(np.float32)
-            # normalize depth to [0,1] in a numerically stable way
-            mn, mx = img_np.min(), img_np.max()
-            if mx > mn:
-                img_np = (img_np - mn) / (mx - mn)
-            else:
-                img_np = np.zeros_like(img_np, dtype=np.float32)
-            return img_np
-    except Exception:
-        pass
-
-    # if nothing worked, return zeros
-    return zeros
+np.set_printoptions(suppress=True, precision=4)
+agent_name = 'td3_per'
 
 
-# --- Helper function for plotting and saving stats ---
-def save_and_plot_metrics(episode, scores, actor_losses, critic_losses, steps, y_positions):
-    df = pd.DataFrame({
-        'episode': range(1, len(scores) + 1), 'score': scores, 'actor_loss': actor_losses,
-        'critic_loss': critic_losses, 'steps': steps, 'y_position': y_positions
-    })
-    if not os.path.exists(config.SAVE_PATH): os.makedirs(config.SAVE_PATH)
-    df.to_csv(os.path.join(config.SAVE_PATH, 'td3_per_stat.csv'), index=False)
+class TD3Agent(object):
+    
+    def __init__(self, state_size, action_size, actor_lr, critic_lr, tau,
+                gamma, lambd, batch_size, memory_size, actor_delay, target_noise,
+                epsilon, epsilon_end, decay_step, load_model, play):
+        self.state_size = state_size
+        self.vel_size = 3
+        self.action_size = action_size
+        self.action_high = 1.5
+        self.action_low = -self.action_high
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.tau = tau
+        self.gamma = gamma
+        self.lambd = lambd
+        self.actor_delay = actor_delay
+        self.target_noise = target_noise
 
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-    fig.suptitle('TD3+PER Training Progress', fontsize=16)
+        self.batch_size = batch_size
+        self.memory_size = memory_size
+        self.epsilon = epsilon
+        self.epsilon_end = epsilon_end
+        self.decay_step = decay_step
+        self.epsilon_decay = (epsilon - epsilon_end) / decay_step
 
-    if len(scores) > 1:
-        p05 = np.percentile(scores, 5)
-        p95 = np.percentile(scores, 95)
-        clipped_scores = np.clip(scores, p05, p95)
-    else:
-        clipped_scores = scores
+        if play:
+            gpu_options = tf.compat.v1.GPUOptions(per_process_gpu_memory_fraction=0.5)
+            self.sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(gpu_options=gpu_options))
+        else:
+            self.sess = tf.compat.v1.Session()
+        # tf.compat.v1.keras.backend.set_session(self.sess)
 
-    axes[0, 0].plot(clipped_scores, label='Total Reward (Clipped)')
-    axes[0, 0].set_title('Total Reward per Episode (Clipped for Clarity)')
-    axes[0, 0].grid(True)
-
-    axes[0, 1].plot(actor_losses, label='Actor Loss', color='orange')
-    axes[0, 1].set_title('Average Actor Loss per Episode')
-    axes[0, 1].grid(True)
-    axes[1, 0].plot(critic_losses, label='Critic Loss', color='green')
-    axes[1, 0].set_title('Average Critic Loss per Episode')
-    axes[1, 0].grid(True)
-    axes[1, 1].plot(steps, label='Steps', color='red')
-    axes[1, 1].set_title('Steps per Episode')
-    axes[1, 1].grid(True)
-    axes[2, 0].plot(y_positions, label='Y Position', color='purple')
-    axes[2, 0].set_title('Final Y Position per Episode')
-    axes[2, 0].grid(True)
-    axes[2, 1].axis('off')
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    if not os.path.exists(config.GRAPH_PATH): os.makedirs(config.GRAPH_PATH)
-    plt.savefig(os.path.join(config.GRAPH_PATH, 'td3_per_training_progress.png'))
-    plt.close()
-    print(f"--- Metrics and plots SAVED for episode {episode + 1} ---")
-
-# --- Ornstein-Uhlenbeck Noise for Exploration ---
-class OUActionNoise:
-    def __init__(self, mean, std_deviation, theta=0.15, dt=1e-2, x_initial=None):
-        self.theta, self.mean, self.std_dev, self.dt, self.x_initial = theta, mean, std_deviation, dt, x_initial
-        self.reset()
-    def __call__(self):
-        x = (self.x_prev + self.theta * (self.mean - self.x_prev) * self.dt +
-             self.std_dev * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape))
-        self.x_prev = x
-        return x
-    def reset(self):
-        self.x_prev = self.x_initial if self.x_initial is not None else np.zeros_like(self.mean)
-
-# --- TD3 Agent Implementation ---
-class TD3Agent:
-    def __init__(self):
-        self.actor = self._build_actor()
-        self.critic_1, self.critic_2 = self._build_critic(), self._build_critic()
-        self.target_actor = self._build_actor()
-        self.target_critic_1, self.target_critic_2 = self._build_critic(), self._build_critic()
-
-        self.target_actor.set_weights(self.actor.get_weights())
-        self.target_critic_1.set_weights(self.critic_1.get_weights())
-        self.target_critic_2.set_weights(self.critic_2.get_weights())
-
-        self.actor_optimizer = Adam(learning_rate=config.ACTOR_LEARNING_RATE)
-        self.critic_optimizer = Adam(learning_rate=config.CRITIC_LEARNING_RATE)
-
-        self.buffer = PrioritizedReplayBuffer(config.BUFFER_SIZE, alpha=config.PER_ALPHA)
-        self.noise = OUActionNoise(mean=np.zeros(config.ACTION_DIM), std_deviation=float(config.EXPLORATION_NOISE) * np.ones(config.ACTION_DIM))
-
-    def _build_actor(self):
-        image_input = Input(shape=config.STATE_IMAGE_SHAPE)
-        conv = Conv2D(32, (8, 8), strides=(4, 4), activation='relu')(image_input)
-        conv = Conv2D(64, (4, 4), strides=(2, 2), activation='relu')(conv)
-        conv = Conv2D(64, (3, 3), strides=(1, 1), activation='relu')(conv)
-        image_flatten = Flatten()(conv)
-        velocity_input = Input(shape=config.STATE_VELOCITY_SHAPE)
-        concat = Concatenate()([image_flatten, velocity_input])
-        dense = Dense(512, activation='relu')(concat) # Increased layer size
-        dense = Dense(512, activation='relu')(dense) # Increased layer size
-        output = Dense(config.ACTION_DIM, activation='tanh')(dense)
-        scaled_output = output * config.ACTION_BOUND
-        return Model(inputs=[image_input, velocity_input], outputs=scaled_output)
-
-    def _build_critic(self):
-        image_input = Input(shape=config.STATE_IMAGE_SHAPE)
-        conv = Conv2D(32, (8, 8), strides=(4, 4), activation='relu')(image_input)
-        conv = Conv2D(64, (4, 4), strides=(2, 2), activation='relu')(conv)
-        conv = Conv2D(64, (3, 3), strides=(1, 1), activation='relu')(conv)
-        image_flatten = Flatten()(conv)
-        velocity_input = Input(shape=config.STATE_VELOCITY_SHAPE)
-        state_concat = Concatenate()([image_flatten, velocity_input])
-        state_dense = Dense(256, activation='relu')(state_concat) # Increased layer size
-        action_input = Input(shape=(config.ACTION_DIM,))
-        action_dense = Dense(256, activation='relu')(action_input) # Increased layer size
-        concat = Concatenate()([state_dense, action_dense])
-        dense = Dense(512, activation='relu')(concat) # Increased layer size
-        dense = Dense(512, activation='relu')(dense) # Increased layer size
-        output = Dense(1)(dense)
-        return Model(inputs=[image_input, velocity_input, action_input], outputs=output)
-
-    def select_action(self, state):
-        image_state = tf.expand_dims(tf.convert_to_tensor(state[0]), 0)
-        velocity_state = tf.expand_dims(tf.convert_to_tensor(state[1]), 0)
-        action = self.actor([image_state, velocity_state])[0].numpy()
-        action += self.noise()
-        return np.clip(action, -config.ACTION_BOUND, config.ACTION_BOUND)
-
-    def train(self, total_steps):
-        # Replay buffer warm-up: skip training until buffer has enough samples
-        if len(self.buffer) < config.BUFFER_WARMUP:
-            if total_steps % 1000 == 0:
-                print(f"Warmup: {len(self.buffer)}/{config.BUFFER_WARMUP} transitions collected")
-            return None, None
-
-        beta = min(config.PER_BETA_END, config.PER_BETA_START + (total_steps * (config.PER_BETA_END - config.PER_BETA_START) / config.PER_BETA_FRAMES))
-
-        states, actions, rewards, next_states, dones, weights, indices = self.buffer.sample(config.BATCH_SIZE, beta=beta)
-
-        state_images = tf.convert_to_tensor(np.array([s[0] for s in states]), dtype=tf.float32)
-        state_velocities = tf.convert_to_tensor(np.array([s[1] for s in states]), dtype=tf.float32)
-        next_state_images = tf.convert_to_tensor(np.array([s[0] for s in next_states]), dtype=tf.float32)
-        next_state_velocities = tf.convert_to_tensor(np.array([s[1] for s in next_states]), dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.float32)
-        rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
-        dones = tf.convert_to_tensor(dones, dtype=tf.float32)
-        weights = tf.convert_to_tensor(weights, dtype=tf.float32)
-
-        actor_loss_val, critic_loss_val = None, None
-
-        with tf.GradientTape(persistent=True) as tape:
-            target_actions = self.target_actor([next_state_images, next_state_velocities])
-            noise = tf.clip_by_value(tf.random.normal(shape=tf.shape(target_actions), stddev=config.POLICY_NOISE),
-                                    -config.NOISE_CLIP, config.NOISE_CLIP)
-            target_actions = tf.clip_by_value(target_actions + noise, -config.ACTION_BOUND, config.ACTION_BOUND)
-
-            target_q1 = self.target_critic_1([next_state_images, next_state_velocities, target_actions])
-            target_q2 = self.target_critic_2([next_state_images, next_state_velocities, target_actions])
-            target_q = tf.minimum(target_q1, target_q2)
-
-            y = rewards + config.GAMMA * (1 - dones) * tf.squeeze(target_q)
-
-            q1 = self.critic_1([state_images, state_velocities, actions])
-            q2 = self.critic_2([state_images, state_velocities, actions])
-
-            td_errors = y - tf.squeeze(q1)
-            critic_1_loss = tf.reduce_mean(weights * tf.square(y - tf.squeeze(q1)))
-            critic_2_loss = tf.reduce_mean(weights * tf.square(y - tf.squeeze(q2)))
-            critic_loss_val = critic_1_loss + critic_2_loss
-
-        critic_params = self.critic_1.trainable_variables + self.critic_2.trainable_variables
-        critic_grad = tape.gradient(critic_loss_val, critic_params)
-        critic_grad = [g if g is not None else tf.zeros_like(v) for g, v in zip(critic_grad, critic_params)]
-        critic_grad, _ = tf.clip_by_global_norm(critic_grad, 40.0)
-        self.critic_optimizer.apply_gradients(zip(critic_grad, critic_params))
-
-        self.buffer.update_priorities(indices, np.abs(td_errors.numpy()))
-
-        if total_steps % config.POLICY_UPDATE_FREQUENCY == 0:
-            with tf.GradientTape() as tape2:
-                new_actions = self.actor([state_images, state_velocities])
-                q1_new = self.critic_1([state_images, state_velocities, new_actions])
-                actor_loss_val = -tf.reduce_mean(q1_new)
-
-            actor_grad = tape2.gradient(actor_loss_val, self.actor.trainable_variables)
-            actor_grad = [g if g is not None else tf.zeros_like(v) for g, v in zip(actor_grad, self.actor.trainable_variables)]
-            actor_grad, _ = tf.clip_by_global_norm(actor_grad, 40.0)
-            self.actor_optimizer.apply_gradients(zip(actor_grad, self.actor.trainable_variables))
-
-            self._soft_update_target_networks()
-
-        del tape
-        return actor_loss_val, critic_loss_val
-
-
-    def _soft_update_target_networks(self):
-        for target, main in zip(self.target_actor.weights, self.actor.weights):
-            target.assign(config.TAU * main + (1 - config.TAU) * target)
-        for target, main in zip(self.target_critic_1.weights, self.critic_1.weights):
-            target.assign(config.TAU * main + (1 - config.TAU) * target)
-        for target, main in zip(self.target_critic_2.weights, self.critic_2.weights):
-            target.assign(config.TAU * main + (1 - config.TAU) * target)
-
-# --- Main Training Loop ---
-if __name__ == '__main__':
-    env = Env()
-    agent = TD3Agent()
-    summary_writer = tf.summary.create_file_writer(config.TENSORBOARD_PATH)
-    start_episode = 0
-    all_scores, all_actor_losses, all_critic_losses, all_steps, all_y_positions = [], [], [], [], []
-    recent_scores = deque(maxlen=100)
-
-    current_noise_level = config.EXPLORATION_NOISE
-
-    # --- Resume Logic ---
-    if os.path.exists(config.MODEL_PATH):
-        model_files = [f for f in os.listdir(config.MODEL_PATH) if f.startswith('actor_ep')]
-        if model_files:
-            latest_episode = max([int(re.search(r'(\d+)', f).group(1)) for f in model_files])
-            actor_path = os.path.join(config.MODEL_PATH, f"actor_ep{latest_episode}.h5")
-            if os.path.exists(actor_path):
-                print(f"Resuming training from episode {latest_episode}...")
-                agent.actor.load_weights(actor_path)
-                agent.critic_1.load_weights(os.path.join(config.MODEL_PATH, f"critic1_ep{latest_episode}.h5"))
-                agent.critic_2.load_weights(os.path.join(config.MODEL_PATH, f"critic2_ep{latest_episode}.h5"))
-                start_episode = latest_episode
-
-                current_noise_level = config.EXPLORATION_NOISE * (config.NOISE_DECAY ** start_episode)
-
-                stats_path = os.path.join(config.SAVE_PATH, 'td3_per_stat.csv')
-                if os.path.exists(stats_path):
-                    df = pd.read_csv(stats_path)
-                    all_scores, all_actor_losses, all_critic_losses, all_steps, all_y_positions = \
-                        df['score'].tolist(), df['actor_loss'].tolist(), df['critic_loss'].tolist(), \
-                        df['steps'].tolist(), df['y_position'].tolist()
-                    recent_scores.extend(all_scores[-100:])
-                    print("Loaded previous training statistics.")
-
-    total_steps = 0
-    for e in range(start_episode, config.MAX_EPISODES):
-        state = env.reset()
-        image_state = _process_image(state[0][0])
-        state = [image_state, state[1]]
-
-        total_reward, episode_steps = 0, 0
-        actor_losses, critic_losses = [], []
-
-        agent.noise.std_dev = max(config.MIN_EXPLORATION_NOISE, current_noise_level)
-
-        consecutive_collisions = 0
+        self.actor, self.critic, self.critic2 = self.build_model()
+        self.target_actor, self.target_critic, self.target_critic2 = self.build_model()
+        # Modern Keras/TF2 optimizers
+        self.actor_optimizer = Adam(self.actor_lr)
+        self.critic_optimizer = Adam(self.critic_lr)
+        self.critic2_optimizer = Adam(self.critic_lr)
+        if load_model:
+            self.load_model('./save_model/'+ agent_name)
         
-        for step in range(config.MAX_STEPS_PER_EPISODE):
-            total_steps += 1
-            action = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
+        self.target_actor.set_weights(self.actor.get_weights())
+        self.target_critic.set_weights(self.critic.get_weights())
+        self.target_critic2.set_weights(self.critic2.get_weights())
+        
+        self.memory = Memory(self.memory_size)
 
-            next_image_state = _process_image(next_state[0][0])
-            next_state_processed = [next_image_state, next_state[1]]
+    def build_model(self):
+        # shared network
+        # image process
+        image = Input(shape=self.state_size)
+        image_process = BatchNormalization()(image)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', padding='same', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(MaxPooling2D((3, 3)))(image_process)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(MaxPooling2D((2, 2)))(image_process)
+        image_process = TimeDistributed(Conv2D(32, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(Conv2D(32, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(MaxPooling2D((2, 2)))(image_process)
+        image_process = TimeDistributed(Conv2D(16, (3, 3), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(MaxPooling2D((2, 2)))(image_process)
+        image_process = TimeDistributed(Conv2D(8, (1, 1), activation='elu', kernel_initializer='he_normal'))(image_process)
+        image_process = TimeDistributed(Flatten())(image_process)
+        image_process = GRU(48, kernel_initializer='he_normal', use_bias=False)(image_process)
+        image_process = BatchNormalization()(image_process)
+        image_process = Activation('tanh')(image_process)
+        
+        # vel process
+        vel = Input(shape=[self.vel_size])
+        vel_process = Dense(48, kernel_initializer='he_normal', use_bias=False)(vel)
+        vel_process = BatchNormalization()(vel_process)
+        vel_process = Activation('tanh')(vel_process)
 
-            # Track consecutive collisions for early termination
-            if info.get('status') == 'collision':
-                consecutive_collisions += 1
-                if consecutive_collisions >= 3:  # End episode after 3 consecutive collisions
-                    done = True
-            else:
-                consecutive_collisions = 0
+        # state process
+        # state_process = Concatenate()([image_process, vel_process])
+        state_process = Add()([image_process, vel_process])
 
-            agent.buffer.add(state, action, reward, next_state_processed, done)
-            actor_loss, critic_loss = agent.train(total_steps)
+        # Actor
+        policy = Dense(32, kernel_initializer='he_normal', use_bias=False)(state_process)
+        policy = BatchNormalization()(policy)
+        policy = ELU()(policy)
+        policy = Dense(32, kernel_initializer='he_normal', use_bias=False)(policy)
+        policy = BatchNormalization()(policy)
+        policy = ELU()(policy)
+        # Modern kernel initializer
+        from keras import initializers
+        policy = Dense(self.action_size, kernel_initializer=initializers.RandomUniform(minval=-3e-3, maxval=3e-3))(policy)
+        # Wrap clipping explicitly with Keras backend
+        policy = Lambda(lambda x: K.clip(x, self.action_low, self.action_high))(policy)
+        actor = Model(inputs=[image, vel], outputs=policy)
+        
+        # Critic
+        action = Input(shape=[self.action_size])
+        action_process = Dense(48, kernel_initializer='he_normal', use_bias=False)(action)
+        action_process = BatchNormalization()(action_process)
+        action_process = Activation('tanh')(action_process)
+        state_action = Add()([state_process, action_process])
 
-            if actor_loss is not None: actor_losses.append(actor_loss.numpy())
-            if critic_loss is not None: critic_losses.append(critic_loss.numpy())
+        Qvalue = Dense(32, kernel_initializer='he_normal', use_bias=False)(state_action)
+        Qvalue = BatchNormalization()(Qvalue)
+        Qvalue = ELU()(Qvalue)
+        Qvalue = Dense(32, kernel_initializer='he_normal', use_bias=False)(Qvalue)
+        Qvalue = BatchNormalization()(Qvalue)
+        Qvalue = ELU()(Qvalue)
+        Qvalue = Dense(1, kernel_initializer=initializers.RandomUniform(minval=-3e-3, maxval=3e-3))(Qvalue)
+        critic = Model(inputs=[image, vel, action], outputs=Qvalue)
 
-            state = next_state_processed
-            total_reward += reward
-            episode_steps = info.get('steps', step + 1)
+        # Critic2
+        action = Input(shape=[self.action_size])
+        action_process2 = Dense(48, kernel_initializer='he_normal', use_bias=False)(action)
+        action_process2 = BatchNormalization()(action_process2)
+        action_process2 = Activation('tanh')(action_process2)
+        state_action2 = Add()([state_process, action_process2])
 
-            if done: break
+        Qvalue2 = Dense(32, kernel_initializer='he_normal', use_bias=False)(state_action2)
+        Qvalue2 = BatchNormalization()(Qvalue2)
+        Qvalue2 = ELU()(Qvalue2)
+        Qvalue2 = Dense(32, kernel_initializer='he_normal', use_bias=False)(Qvalue2)
+        Qvalue2 = BatchNormalization()(Qvalue2)
+        Qvalue2 = ELU()(Qvalue2)
+        Qvalue2 = Dense(1, kernel_initializer=initializers.RandomUniform(minval=-3e-3, maxval=3e-3))(Qvalue2)
+        critic2 = Model(inputs=[image, vel, action], outputs=Qvalue2)
 
-        current_noise_level *= config.NOISE_DECAY
+        # _make_predict_function() calls removed for TF2.x/Keras3.x compatibility
 
-        recent_scores.append(total_reward)
-        avg_reward_100 = np.mean(recent_scores) if recent_scores else 0
+        return actor, critic, critic2
 
-        all_scores.append(total_reward)
-        all_actor_losses.append(np.mean(actor_losses) if actor_losses else 0)
-        all_critic_losses.append(np.mean(critic_losses) if critic_losses else 0)
-        all_steps.append(episode_steps)
-        all_y_positions.append(info.get('Y', 0))
+    # Old optimizer functions (build_actor_optimizer, build_critic_optimizer, build_critic2_optimizer) removed.
 
-       # This is the new, modified line
-        print(f"Ep: {e+1}, Steps: {episode_steps}, Y: {info.get('Y', 0):.2f}, Reward: {total_reward:.2f}, Avg R(100): {avg_reward_100:.2f}, Noise: {agent.noise.std_dev:.3f}, Status: {info.get('status')}")
+    def train_model(self):
+        batch, idxs, _ = self.memory.sample(self.batch_size)
 
-        with summary_writer.as_default():
-            tf.summary.scalar('Total Reward', total_reward, step=e)
-            tf.summary.scalar('Average Reward (Last 100)', avg_reward_100, step=e)
-            tf.summary.scalar('Steps per Episode', episode_steps, step=e)
-            tf.summary.scalar('Exploration Noise', agent.noise.std_dev, step=e)
+        images = np.zeros([self.batch_size] + self.state_size)
+        vels = np.zeros([self.batch_size, self.vel_size])
+        actions = np.zeros((self.batch_size, self.action_size))
+        rewards = np.zeros((self.batch_size, 1))
+        next_images = np.zeros([self.batch_size] + self.state_size)
+        next_vels = np.zeros([self.batch_size, self.vel_size])
+        dones = np.zeros((self.batch_size, 1))
 
-        if (e + 1) % config.SAVE_FREQ == 0:
-            if not os.path.exists(config.MODEL_PATH): os.makedirs(config.MODEL_PATH)
-            agent.actor.save(os.path.join(config.MODEL_PATH, f"actor_ep{e+1}.h5"))
-            agent.critic_1.save(os.path.join(config.MODEL_PATH, f"critic1_ep{e+1}.h5"))
-            agent.critic_2.save(os.path.join(config.MODEL_PATH, f"critic2_ep{e+1}.h5"))
-            save_and_plot_metrics(e, all_scores, all_actor_losses, all_critic_losses, all_steps, all_y_positions)
+        for i, sample in enumerate(batch):
+            images[i], vels[i] = sample[0]
+            actions[i] = sample[1]
+            rewards[i] = sample[2]
+            next_images[i], next_vels[i] = sample[3]
+            dones[i] = sample[4]
+        states = [images, vels]
+        next_states = [next_images, next_vels]
 
-    env.disconnect()
+        # --- TD3 target policy smoothing and target Q
+        target_actions = self.target_actor.predict(next_states, verbose=0)
+        target_noises = np.clip(
+            np.random.normal(0, self.target_noise, target_actions.shape),
+            -0.5, 0.5)
+        target_actions = np.clip(target_actions + target_noises, self.action_low, self.action_high)
+        target_next_Qs1 = self.target_critic.predict(next_states + [target_actions], verbose=0)
+        target_next_Qs2 = self.target_critic2.predict(next_states + [target_actions], verbose=0)
+        target_next_Qs = np.minimum(target_next_Qs1, target_next_Qs2)
+        targets = rewards + self.gamma * (1 - dones) * target_next_Qs
+
+        actor_loss = 0.0
+        critic_loss = 0.0
+        pred = np.zeros_like(targets)
+        for _ in range(self.actor_delay):
+            with tf.GradientTape() as tape_critic, tf.GradientTape() as tape_critic2:
+                q_pred_1 = self.critic([images, vels, actions], training=True)
+                q_pred_2 = self.critic2([images, vels, actions], training=True)
+                pred = q_pred_1.numpy()
+                c_loss_1 = tf.keras.losses.MeanSquaredError()(targets, q_pred_1)
+                c_loss_2 = tf.keras.losses.MeanSquaredError()(targets, q_pred_2)
+                c_loss = c_loss_1 + c_loss_2
+            grads_critic = tape_critic.gradient(c_loss_1, self.critic.trainable_variables)
+            grads_critic2 = tape_critic2.gradient(c_loss_2, self.critic2.trainable_variables)
+            self.critic_optimizer.apply_gradients(zip(grads_critic, self.critic.trainable_variables))
+            self.critic2_optimizer.apply_gradients(zip(grads_critic2, self.critic2.trainable_variables))
+            critic_loss += float(c_loss_1) + float(c_loss_2)
+
+        # --- Actor update
+        with tf.GradientTape() as tape_actor:
+            # Only update actor using states -> use current vels/images (not actions)
+            cur_actions = self.actor([images, vels], training=True)
+            q = self.critic([images, vels, cur_actions], training=True)
+            a_loss = -tf.reduce_mean(q)
+        grads_actor = tape_actor.gradient(a_loss, self.actor.trainable_variables)
+        self.actor_optimizer.apply_gradients(zip(grads_actor, self.actor.trainable_variables))
+        actor_loss = float(a_loss)
+
+        tds = np.abs(pred - targets)
+        for i in range(self.batch_size):
+            idx = idxs[i]
+            self.memory.update(idx, tds[i])
+
+        return actor_loss, critic_loss / (self.actor_delay * 2.0)
+
+    def get_action(self, state):
+        policy = self.actor.predict(state, verbose=0)[0]
+        noise = np.random.normal(0, self.epsilon, self.action_size)
+        action = np.clip(policy + noise, self.action_low, self.action_high)
+        return action, policy
+
+
+    def append_memory(self, state, action, reward, next_state, done):        
+        Q = self.critic.predict(state + [action.reshape(1, -1)], verbose=0)[0]
+        target_action = self.target_actor.predict(next_state, verbose=0)[0]
+        target_Q1 = self.target_critic.predict(next_state + [target_action.reshape(1, -1)], verbose=0)[0]
+        target_Q2 = self.target_critic2.predict(next_state + [target_action.reshape(1, -1)], verbose=0)[0]
+        target_Q = np.minimum(target_Q1, target_Q2)
+        td = reward + (1  -done) * self.gamma * target_Q - Q
+        td = float(abs(td[0]))
+        self.memory.add(td, (state, action, reward, next_state, done))
+        return td
+        
+    def load_model(self, name):
+        if os.path.exists(name + '_actor.weights.h5'):
+            self.actor.load_weights(name + '_actor.weights.h5')
+            print('Actor loaded')
+        if os.path.exists(name + '_critic.weights.h5'):
+            self.critic.load_weights(name + '_critic.weights.h5')
+            print('Critic loaded')
+        if os.path.exists(name + '_critic2.weights.h5'):
+            self.critic2.load_weights(name + '_critic2.weights.h5')
+            print('Critic2 loaded')
+
+    def save_model(self, name):
+        self.actor.save_weights(name + '_actor.weights.h5')
+        self.critic.save_weights(name + '_critic.weights.h5')
+        self.critic2.save_weights(name + '_critic2.weights.h5')
+
+    def update_target_model(self):
+        self.target_actor.set_weights(
+            self.tau * np.array(self.actor.get_weights()) \
+            + (1 - self.tau) * np.array(self.target_actor.get_weights())
+        )
+        self.target_critic.set_weights(
+            self.tau * np.array(self.critic.get_weights()) \
+            + (1 - self.tau) * np.array(self.target_critic.get_weights())
+        )
+        self.target_critic2.set_weights(
+            self.tau * np.array(self.critic2.get_weights()) \
+            + (1 - self.tau) * np.array(self.target_critic2.get_weights())
+        )
+
+
+'''
+Environment interaction
+'''
+
+def transform_input(responses, img_height, img_width):
+    img1d = np.array(responses[0].image_data_float, dtype=float)
+    img1d = np.array(np.clip(255 * 3 * img1d, 0, 255), dtype=np.uint8)
+    img2d = np.reshape(img1d, (responses[0].height, responses[0].width))
+    image = Image.fromarray(img2d)
+    image = np.array(image.resize((img_width, img_height)).convert('L'))
+    cv2.imwrite('view.png', np.uint8(image))
+    image = np.float32(image.reshape(1, img_height, img_width, 1))
+    image /= 255.0
+    return image
+
+def transform_action(action):
+    real_action = np.array(action)
+    real_action[1] += 0.5
+    # real_action[0] *= 0.5
+    # real_action[2] *= 0.5
+
+    return real_action
+
+if __name__ == '__main__':
+    # argument parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose',    action='store_true')
+    parser.add_argument('--load_model', action='store_true')
+    parser.add_argument('--play',       action='store_true')
+    parser.add_argument('--img_height', type=int,   default=144)
+    parser.add_argument('--img_width',  type=int,   default=256)
+    parser.add_argument('--actor_lr',   type=float, default=5e-5)
+    parser.add_argument('--critic_lr',  type=float, default=2.5e-4)
+    parser.add_argument('--tau',        type=float, default=2.5e-3)
+    parser.add_argument('--gamma',      type=float, default=0.99)
+    parser.add_argument('--lambd',      type=float, default=0.90)
+    parser.add_argument('--seqsize',    type=int,   default=6)
+    parser.add_argument('--epoch',      type=int,   default=1)
+    parser.add_argument('--batch_size', type=int,   default=64)
+    parser.add_argument('--memory_size',type=int,   default=100000)
+    parser.add_argument('--train_start',type=int,   default=2000)
+    parser.add_argument('--train_rate', type=int,   default=4)
+    parser.add_argument('--epsilon',    type=float, default=1.0)
+    parser.add_argument('--target_noise',type=int,  default=0.02)
+    parser.add_argument('--epsilon_end',type=float, default=0.01)
+    parser.add_argument('--decay_step', type=int,   default=10000)
+    parser.add_argument('--actor_delay',type=int,   default=2)
+    parser.add_argument('--random',     type=float, default=0.05)
+    
+    args = parser.parse_args()
+
+    if not os.path.exists('save_graph/'+ agent_name):
+        os.makedirs('save_graph/'+ agent_name)
+    if not os.path.exists('save_stat'):
+        os.makedirs('save_stat')
+    if not os.path.exists('save_model'):
+        os.makedirs('save_model')
+
+    # CUDA config
+    tf_config = tf.compat.v1.ConfigProto()
+    tf_config.gpu_options.allow_growth = True
+
+    # Make RL agent
+    state_size = [args.seqsize, args.img_height, args.img_width, 1]
+    action_size = 3
+    agent = TD3Agent(
+        state_size=state_size,
+        action_size=action_size,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        tau=args.tau,
+        gamma=args.gamma,
+        lambd=args.lambd,
+        batch_size=args.batch_size,
+        memory_size=args.memory_size,
+        epsilon=args.epsilon,
+        epsilon_end=args.epsilon_end,
+        decay_step=args.decay_step,
+        actor_delay=args.actor_delay,
+        target_noise=args.target_noise,
+        load_model=args.load_model,
+        play=args.play
+    )
+
+    episode = 0
+    env = Env()
+
+    if args.play:
+        while True:
+            try:
+                done = False
+                bug = False
+
+                # stats
+                bestY, timestep, score, avgvel, avgQ = 0., 0, 0., 0., 0.
+
+                observe = env.reset()
+                image, vel = observe
+                try:
+                    image = transform_input(image, args.img_height, args.img_width)
+                except:
+                    continue
+                history = np.stack([image] * args.seqsize, axis=1)
+                vel = vel.reshape(1, -1)
+                state = [history, vel]
+                while not done:
+                    timestep += 1
+                    # snapshot = np.zeros([0, args.img_width, 1])
+                    # for snap in state[0][0]:
+                    #     snapshot = np.append(snapshot, snap, axis=0)
+                    # snapshot *= 128
+                    # snapshot += 128
+                    # cv2.imshow('%s' % timestep, np.uint8(snapshot))
+                    # cv2.waitKey(0)
+                    action = agent.actor.predict(state, verbose=0)[0]
+                    # noise = [np.random.normal(scale=args.epsilon) for _ in range(action_size)]
+                    # noise = np.array(noise, dtype=np.float32)
+                    # action = np.clip(action + noise, -1, 1)
+                    real_action = transform_action(action)
+                    observe, reward, done, info = env.step(transform_action(real_action))
+                    image, vel = observe
+                    try:
+                        image = transform_input(image, args.img_height, args.img_width)
+                    except:
+                        bug = True
+                        break
+                    history = np.append(history[:, 1:], [image], axis=1)
+                    vel = vel.reshape(1, -1)
+                    next_state = [history, vel]
+                    # stats
+                    avgQ += float(agent.critic.predict(state + [action.reshape(1, -1)], verbose=0)[0][0])
+                    avgvel += float(np.linalg.norm(real_action))
+                    score += reward
+                    if info['Y'] > bestY:
+                        bestY = info['Y']
+                    print('%s' % (real_action), end='\r', flush=True)
+
+                    if args.verbose:
+                        print('Step %d Action %s Reward %.2f Info %s:' % (timestep, real_action, reward, info['status']))
+
+                    state = next_state
+
+                if bug:
+                    continue
+                
+                avgQ /= timestep
+                avgvel /= timestep
+
+                # done
+                print('Ep %d: BestY %.3f Step %d Score %.2f AvgQ %.2f AvgVel %.2f'
+                        % (episode, bestY, timestep, score, avgQ, avgvel))
+
+                episode += 1
+            except KeyboardInterrupt:
+                env.disconnect()
+                break
+    else:
+        # Train
+        time_limit = 600
+        highscoreY = 0.
+        if os.path.exists('save_stat/'+ agent_name + '_stat.csv'):
+            with open('save_stat/'+ agent_name + '_stat.csv', 'r') as f:
+                read = list(csv.reader(f))
+                if not read:
+                    episode = 0
+                else:
+                    episode = int(float(read[-1][0]))
+                    print('Last episode:', episode)
+                    episode += 1
+        if os.path.exists('save_stat/'+ agent_name + '_highscore.csv'):
+            with open('save_stat/'+ agent_name + '_highscore.csv', 'r') as f:
+                read = csv.reader(f)
+                highscoreY = float(next(reversed(list(read)))[0])
+                print('Best Y:', highscoreY)
+        global_step = 0
+        actor_step = 0
+        while True:
+            try:
+                done = False
+                bug = False
+                # exploring episode
+                random = (np.random.random() < args.random)
+
+                # stats
+                bestY, timestep, score, avgvel, avgQ, avgAct = 0., 0, 0., 0., 0., 0.
+                train_num, actor_loss, critic_loss, tds, maxtd = 0, 0., 0., 0., 0.
+
+                try:
+                    observe = env.reset()
+                    image, vel = observe
+                    try:
+                        image = transform_input(image, args.img_height, args.img_width)
+                    except Exception as e:
+                        continue
+                    history = np.stack([image] * args.seqsize, axis=1)
+                    vel = vel.reshape(1, -1)
+                    state = [history, vel]
+                    while not done and timestep < time_limit:
+                        timestep += 1
+                        global_step += 1
+                        if len(agent.memory) >= args.train_start and global_step >= args.train_rate:
+                            for _ in range(args.epoch):
+                                a_loss, c_loss = agent.train_model()
+                                actor_loss += float(a_loss)
+                                critic_loss += float(c_loss)
+                                train_num += 1
+                            agent.update_target_model()
+                            global_step = 0
+                        if random:
+                            action = policy = np.random.uniform(-1, 1, action_size)
+                        else:
+                            action, policy = agent.get_action(state)
+                        real_action, real_policy = transform_action(action), transform_action(policy)
+                        try:
+                            observe, reward, done, info = env.step(real_action)
+                        except Exception as e:
+                            bug = True
+                            break
+                        image, vel = observe
+                        try:
+                            if timestep < 3 and info['status'] == 'landed':
+                                raise Exception
+                            image = transform_input(image, args.img_height, args.img_width)
+                        except Exception as e:
+                            bug = True
+                            break
+                        history = np.append(history[:, 1:], [image], axis=1)
+                        vel = vel.reshape(1, -1)
+                        next_state = [history, vel]
+                        td = agent.append_memory(state, action, reward, next_state, done)
+                        maxtd = max(td, maxtd)
+                        tds += td
+                        avgQ += float(agent.critic.predict(state + [action.reshape(1, -1)], verbose=0)[0][0])
+                        avgvel += float(np.linalg.norm(real_policy))
+                        avgAct += float(np.linalg.norm(real_action))
+                        score += reward
+                        if info['Y'] > bestY:
+                            bestY = info['Y']
+                        if args.verbose:
+                            print('Step %d Action %s Reward %.2f Info %s:' % (timestep, real_action, reward, info['status']))
+                        state = next_state
+                        if agent.epsilon > agent.epsilon_end:
+                            agent.epsilon -= agent.epsilon_decay
+                except Exception as e:
+                    import traceback
+                    print(f"[ERROR] UNCAUGHT EPISODE ERROR: {e}\n"+traceback.format_exc())
+                    bug = True
+                    continue
+                if bug:
+                    continue
+                if train_num:
+                    actor_loss /= train_num
+                    critic_loss /= train_num
+                avgQ /= timestep
+                avgvel /= timestep
+                avgAct /= timestep
+                tds /= timestep
+
+                # done
+                if args.verbose or episode % 10 == 0:
+                    print('Ep %d: BestY %.3f Step %d Score %.2f Q %.2f Vel %.2f Act %.2f'
+                            % (episode, bestY, timestep, score, avgQ, avgvel, avgAct))
+                # Always print detailed log after every episode
+                print(f"[LOG] Ep {episode} | Steps: {timestep} | Best Y: {bestY:.3f} | Score: {score:.2f} | Avg Q: {avgQ:.3f} | Avg Vel: {avgvel:.3f} | Avg Act: {avgAct:.3f} | Actor loss: {actor_loss:.5f} | Critic loss: {critic_loss:.5f} | Status: {info['status']} | Level: {info['level']} | TDS: {tds:.5f} | MaxTD: {maxtd:.5f}")
+                stats = [
+                    episode, timestep, score, bestY, avgvel, \
+                    actor_loss, critic_loss, info['level'], avgQ, avgAct, info['status'],
+                    tds, maxtd
+                ]
+                # log stats
+                with open('save_stat/'+ agent_name + '_stat.csv', 'a', encoding='utf-8', newline='') as f:
+                    wr = csv.writer(f)
+                    wr.writerow(['%.4f' % s if type(s) is float else s for s in stats])
+                if highscoreY < bestY:
+                    highscoreY = bestY
+                    with open('save_stat/'+ agent_name + '_highscore.csv', 'w', encoding='utf-8', newline='') as f:
+                        wr = csv.writer(f)
+                        wr.writerow('%.4f' % s if type(s) is float else s for s in [highscoreY, episode, score, dt.now().strftime('%Y-%m-%d %H:%M:%S')])
+                    agent.save_model('./save_model/'+ agent_name + '_best')
+                agent.save_model('./save_model/'+ agent_name)
+                episode += 1
+            except KeyboardInterrupt:
+                env.disconnect()
+                break
